@@ -9,6 +9,7 @@ from __future__ import annotations
 from ..app import Platform
 from ..audit.timeline import build_timeline
 from ..errors import CokeError
+from ..timeseries import TimeGrid
 from .router import Router
 
 
@@ -42,8 +43,13 @@ class Api:
         add("GET", "/api/alarms", lambda params, body: {"alarms": self._platform.audit.alarms()})
         add("GET", "/api/events", self._events)
         add("GET", "/api/trend", self._trend)
+        add("GET", "/api/aligned", self._aligned)
         add("GET", "/api/store", self._store)
         add("GET", "/api/timeline", self._timeline)
+        add("GET", "/api/heats", self._heats)
+        add("GET", "/api/heats/replay", self._heat_replay)
+        add("POST", "/api/heats/replay", self._build_heat_replay)
+        add("GET", "/api/heats/verify", self._verify_heat_replay)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/step", self._step)
@@ -94,6 +100,34 @@ class Api:
             "signal": signal,
             "period_s": self._platform.trend.period_s,
             "samples": [sample.as_dict() for sample in filled],
+            "clock_rollbacks": len(self._platform.trend.clock_issues(signal)),
+            "trusted": not self._platform.trend.clock_issues(signal),
+        }
+
+    def _aligned(self, params: dict, body: dict) -> dict:
+        signal = params.get("signal", "collector_pressure")
+        if "start_ts" not in params:
+            raise CokeError("缺少 start_ts 参数", component="console")
+        start_s = _as_float(params, "start_ts", 0.0)
+        end_s = _as_float(params, "end_ts", start_s)
+        if end_s < start_s:
+            raise CokeError("end_ts 不能早于 start_ts", component="console")
+        period_s = _as_float(params, "period_s", self._platform.trend.period_s)
+        if period_s <= 0:
+            raise CokeError("period_s 必须为正", component="console")
+        points = self._platform.trend.aligned(
+            signal,
+            start_s,
+            end_s,
+            grid=TimeGrid(period_s=period_s),
+        )
+        return {
+            "signal": signal,
+            "start_ts": round(start_s, 3),
+            "end_ts": round(end_s, 3),
+            "period_s": period_s,
+            "policy": self._platform.trend.policy(signal).as_dict(),
+            "points": [point.as_dict() for point in points],
         }
 
     def _store(self, params: dict, body: dict) -> dict:
@@ -108,6 +142,32 @@ class Api:
         oven = params.get("oven")
         records = self._platform.audit.records(limit=int(params.get("limit", 200)))
         return {"timeline": build_timeline(records, oven=oven)}
+
+    def _heats(self, params: dict, body: dict) -> dict:
+        return self._platform.heat_segments()
+
+    def _heat_replay(self, params: dict, body: dict) -> dict:
+        heat_id = params.get("heat_id")
+        if not heat_id:
+            raise CokeError("缺少 heat_id 参数", component="console")
+        return self._platform.replay_heat(heat_id)
+
+    def _build_heat_replay(self, params: dict, body: dict) -> dict:
+        heat_id = str(body.get("heat_id", params.get("heat_id", "")))
+        if not heat_id:
+            raise CokeError("缺少 heat_id 参数", component="console")
+        signals = body.get("signals")
+        if isinstance(signals, str):
+            signals = [item.strip() for item in signals.split(",") if item.strip()]
+        if signals is not None and not isinstance(signals, list):
+            raise CokeError("signals 必须是数组或逗号分隔字符串", component="console")
+        return self._platform.build_heat_replay(heat_id, signals=[str(item) for item in signals or []] or None)
+
+    def _verify_heat_replay(self, params: dict, body: dict) -> dict:
+        heat_id = params.get("heat_id")
+        if not heat_id:
+            raise CokeError("缺少 heat_id 参数", component="console")
+        return self._platform.verify_heat_replay(heat_id)
 
     def _journal(self, params: dict, body: dict) -> dict:
         journal = self._platform.audit.journal

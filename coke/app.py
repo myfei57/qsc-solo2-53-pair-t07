@@ -42,7 +42,7 @@ from .quench.machine import QuenchCar
 from .sequence import charge_oven, clean_door, push_oven, quench_oven, reverse_heating
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
-from .telemetry import TrendBuffer
+from .timeseries import HeatReplay, TrendBuffer
 
 DEFAULT_UNIT = "battery1"
 DEFAULT_OVEN = "oven01"
@@ -68,6 +68,7 @@ class Platform:
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=5.0)
+        self.heat_replay = HeatReplay(self.trend, self.bus, store, grid=None)
         self.ids = IdFactory("op")
 
         self.pusher = PusherMachine(self.config.pusher)
@@ -450,6 +451,45 @@ class Platform:
         """返回命名空间摘要。"""
 
         return self.namespaces.describe()
+
+    def heat_segments(self) -> dict:
+        """从审计流水生成炉段列表；切段口径固定为炉界。"""
+
+        records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
+        segmentation = self.heat_replay.segmentation(records)
+        return segmentation.as_dict()
+
+    def build_heat_replay(self, heat_id: str, signals: list[str] | None = None) -> dict:
+        """生成并落盘某一炉的统一时间轴对齐结果。"""
+
+        records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
+        segmentation = self.heat_replay.segmentation(records)
+        segment = segmentation.find(heat_id)
+        if segment is None:
+            raise CokeError(f"炉段 {heat_id!r} 不存在", component="timeseries")
+        return self.heat_replay.build(
+            segment,
+            records,
+            signals=signals,
+            created_ts=self.clock.now(),
+            persist=True,
+        )
+
+    def replay_heat(self, heat_id: str) -> dict:
+        """读取已落盘的某炉回放，不存在时先生成。"""
+
+        manifest = self.heat_replay.load(heat_id)
+        if manifest is None:
+            return self.build_heat_replay(heat_id)
+        return manifest
+
+    def verify_heat_replay(self, heat_id: str) -> dict:
+        """校验已落盘炉段回放的时间轴和内容校验和。"""
+
+        manifest = self.heat_replay.load(heat_id)
+        if manifest is None:
+            raise CokeError(f"炉段 {heat_id!r} 尚未生成回放", component="timeseries")
+        return {"heat_id": heat_id, **self.heat_replay.verify(manifest)}
 
     def status(self) -> dict:
         """汇总状态快照，供控制台与命令行读取。"""
