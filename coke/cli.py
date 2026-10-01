@@ -7,6 +7,8 @@
             控制周期 → 并发探测 → 行程标定），用于交付前的真实运行检查；
 ``status``  打印当前状态快照；
 ``config``  打印生效配置；
+``align``   把登记的各路信号对齐到统一时间网格并按炉界切段，落审计流水；
+``replay``  按炉号回放某一炉（``--verify`` 时改为核对对齐与审计的一致性）；
 ``reset``   清掉落盘的平台计数。
 """
 
@@ -75,8 +77,16 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     reversal = platform.reverse(oven="oven01", temperature_c=config.heating.temp_target_c)
     push = platform.push(oven="oven01", guide_target_mm=0.0, guide_measured_mm=0.0)
     quench = platform.quench(oven="oven01")
-    cycles = [platform.cycle(dt=1.0) for _ in range(8)]
+    cycles = []
+    for _ in range(8):
+        # 控制周期用 dt 推进仿真；可推进时钟下同步推进墙钟，否则各周期采样
+        # 时间戳全部相同，会被对齐层正确地判成时间戳倒退。
+        clock.advance(1.0)
+        cycles.append(platform.cycle(dt=1.0))
     cleaning = platform.clean(oven="oven01")
+    # 趋势各采各的，演示里把它们对齐到统一网格并按炉切一段，验证可回放可核对。
+    alignment = platform.build_alignment_run()
+    alignment_verify = platform.verify_alignment_run(alignment["run_id"])
     concurrency = platform.concurrency_probe(rounds=args.rounds)
     calibration = platform.calibrate_stroke(value_mm=3212.0)
     shutdown = platform.stop()
@@ -97,6 +107,13 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "cleaning": {"ok": cleaning["ok"], "steps": [step["action"] for step in cleaning["steps"]]},
+        "alignment": {
+            "run_id": alignment["run_id"],
+            "heat_count": alignment["heats"]["count"],
+            "grid_points": alignment["grid"]["count"],
+            "anomalies": len(alignment["anomalies"]),
+            "verified": alignment_verify["ok"],
+        },
         "concurrency": concurrency,
         "calibration": calibration,
         "shutdown": shutdown,
@@ -128,6 +145,62 @@ def _cmd_config(args: argparse.Namespace) -> int:
     config_path = getattr(args, "config", None)
     config = load_config(config_path) if config_path else default_config()
     _dump(config_to_mapping(config))
+    return 0
+
+
+def _cmd_align(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    if args.tsv:
+        count = _ingest_tsv(platform, args.tsv)
+        print(f"已收录 {count} 条原始样本", file=sys.stderr)
+    payload = platform.build_alignment_run()
+    if args.brief:
+        _dump(
+            {
+                "run_id": payload["run_id"],
+                "window": payload["window"],
+                "grid": payload["grid"],
+                "heats": [
+                    {key: heat[key] for key in ("heat_id", "start_ts", "end_ts", "trusted", "anomalies")}
+                    for heat in payload["heats"]["heats"]
+                ],
+                "anomalies": payload["anomalies"],
+                "digest": payload["digest"],
+            }
+        )
+    else:
+        _dump(payload)
+    return 0
+
+
+def _ingest_tsv(platform: Platform, path: str) -> int:
+    """从 TSV（signal<TAB>ts<TAB>value，可选第四列 kind）按行收录原始样本。"""
+
+    count = 0
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 3:
+                raise CokeError(f"{path}:{line_number} 行列数不足（需 signal/ts/value）", component="cli")
+            kind = parts[3].strip() if len(parts) > 3 and parts[3].strip() else None
+            platform.ingest_signal(parts[0].strip(), float(parts[1]), float(parts[2]), kind)
+            count += 1
+    return count
+
+
+def _cmd_replay(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    if args.verify:
+        report = platform.verify_alignment_run(run_id=args.run_id)
+        _dump(report)
+        return 0 if report["ok"] else 1
+    if not args.heat:
+        _dump(platform.alignment_heats(run_id=args.run_id))
+        return 0
+    _dump(platform.replay_heat(heat_id=args.heat, run_id=args.run_id))
     return 0
 
 
@@ -167,6 +240,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     config = sub.add_parser("config", help="打印生效配置", parents=[common])
     config.set_defaults(func=_cmd_config)
+
+    align = sub.add_parser("align", help="对齐统一时间网格并按炉切段", parents=[common])
+    align.add_argument("--tsv", help="从 TSV（signal ts value [kind]）导入现场原始样本")
+    align.add_argument("--brief", action="store_true", help="只打印窗口、炉段与异常，省略逐点值")
+    align.set_defaults(func=_cmd_align)
+
+    replay = sub.add_parser("replay", help="列出炉段或按炉回放", parents=[common])
+    replay.add_argument("--heat", help="炉号（形如 oven01#1）；缺省只列炉段跳转表")
+    replay.add_argument("--run-id", dest="run_id", help="指定对齐结果，缺省取最近一次")
+    replay.add_argument("--verify", action="store_true", help="改为核对对齐与审计的一致性")
+    replay.set_defaults(func=_cmd_replay)
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)

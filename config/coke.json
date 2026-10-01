@@ -48,5 +48,9 @@
       "damper_rate_deg_per_s": 14.0,
       "linkage_lag_s": 1.5
     }
+  },
+  "alignment": {
+    "grid_period_s": 5.0,
+    "max_gap_periods": 3
   }
 }

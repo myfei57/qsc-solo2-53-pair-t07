@@ -13,6 +13,17 @@ import threading
 
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
+from .alignment import (
+    ANALOG,
+    STATE,
+    AlignmentRun,
+    SignalSpec,
+    build_alignment,
+    list_heat_jumps,
+    replay_heat,
+    run_from_dict,
+    verify_alignment,
+)
 from .charger.machine import ChargingCar
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
@@ -40,6 +51,7 @@ from .pusher.speed import SpeedArbiter
 from .pusher.stroke import StrokeBaseline
 from .quench.machine import QuenchCar
 from .sequence import charge_oven, clean_door, push_oven, quench_oven, reverse_heating
+from .signallog import SignalLog
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .telemetry import TrendBuffer
@@ -65,10 +77,15 @@ class Platform:
         store = JsonStore(self.config.storage_root)
         self.store = store
         self.audit = AuditLog(self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512))
+        self.alignment_journal = JsonlJournal(store.root, "alignment", segment_limit=128)
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
-        self.trend = TrendBuffer(period_s=5.0)
+        self.trend = TrendBuffer(period_s=self.config.alignment.grid_period_s)
+        self.signals = SignalLog(default_max_gap_periods=self.config.alignment.max_gap_periods)
+        self._register_signals()
+        self._last_alignment: dict | None = None
         self.ids = IdFactory("op")
+        self.alignment_ids = IdFactory("align")
 
         self.pusher = PusherMachine(self.config.pusher)
         self.stroke = StrokeBaseline(
@@ -114,6 +131,14 @@ class Platform:
         ):
             self.namespaces.register(area, device, kind)
 
+    def _register_signals(self) -> None:
+        """登记控制周期自产趋势的信号类型：模拟量前插、状态量分段保持。"""
+
+        gap = self.config.alignment.max_gap_periods
+        self.signals.register("collector_pressure", ANALOG, max_gap_periods=gap)
+        self.signals.register("damper_angle", ANALOG, max_gap_periods=gap)
+        self.signals.register("dust_fan", STATE, max_gap_periods=gap)
+
     def _restore(self) -> None:
         """从落盘审计回放最后一次换向，恢复换向间隔计时。"""
 
@@ -130,6 +155,9 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        recorded = self.alignment_journal.read_all()
+        if recorded:
+            self._last_alignment = recorded[-1]
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -324,6 +352,11 @@ class Platform:
                 self.schedule.clear()
             self.trend.append("collector_pressure", moment, pressure)
             self.trend.append("damper_angle", moment, angle)
+            # 原始样本按到达序进 SignalLog；这里不排序、不补点，倒退与缺采
+            # 留到对齐时按统一网格检出并标不可信。
+            self.signals.ingest("collector_pressure", moment, pressure)
+            self.signals.ingest("damper_angle", moment, angle)
+            self.signals.ingest("dust_fan", moment, 1.0 if self.dust.is_running() else 0.0)
             self._persist()
             return {
                 "cycle": self._cycles,
@@ -486,8 +519,29 @@ class Platform:
             "dust": self.dust_snapshot().as_dict(),
             "dust_starts": self.dust.starts(),
             "audit": self.audit.summary(),
+            "alignment": self.alignment_summary(),
             "ids_issued": self.ids.issued(),
         }
+
+    def alignment_summary(self) -> dict:
+        """返回信号登记与最近一次对齐的摘要，供控制台状态页展示。"""
+
+        summary = self.signals.summary()
+        summary["runs"] = self.alignment_journal.count()
+        summary["grid_period_s"] = self.config.alignment.grid_period_s
+        summary["cutting_boundary"] = "heat"
+        if self._last_alignment is not None:
+            last = self._last_alignment
+            summary["last_run"] = {
+                "run_id": last.get("run_id"),
+                "heat_count": last.get("heats", {}).get("count", 0),
+                "grid_points": last.get("grid", {}).get("count", 0),
+                "anomalies": len(last.get("anomalies", [])),
+                "digest": last.get("digest"),
+            }
+        else:
+            summary["last_run"] = None
+        return summary
 
     def snapshot(self) -> dict:
         """返回只读的整体快照（状态 + 拓扑 + 命名空间 + 趋势）。"""
@@ -498,6 +552,152 @@ class Platform:
             "namespaces": self.namespaces_describe(),
             "trend": self.trend.snapshot(),
         }
+
+    # ------------------------------------------------------------------
+    # 趋势对齐与按炉回放
+    # ------------------------------------------------------------------
+
+    def ingest_signal(self, signal: str, ts: float, value: float, kind: str | None = None) -> dict:
+        """收录一路现场原始样本（各信号各采各的，按到达序）。"""
+
+        try:
+            sample = self.signals.ingest(signal, ts, value, kind)
+        except ValueError as error:
+            raise CokeError(str(error), component="alignment") from error
+        return sample.as_dict()
+
+    def _audit_records(self) -> list[AuditRecord]:
+        raw = self.audit.replay_from_journal(limit=100_000)
+        return self.audit.to_records(raw)
+
+    def _signal_specs(self, only: list[str] | None) -> list[SignalSpec]:
+        wanted = set(only) if only else None
+        specs = [
+            SignalSpec(
+                signal=info.signal,
+                kind=info.kind,
+                max_gap_periods=info.max_gap_periods,
+            )
+            for info in self.signals.signals()
+            if wanted is None or info.signal in wanted
+        ]
+        if wanted is not None and len(specs) != len(wanted):
+            missing = sorted(wanted - {spec.signal for spec in specs})
+            raise CokeError(f"未登记的信号: {missing}", component="alignment")
+        return specs
+
+    def build_alignment_run(self, signals: list[str] | None = None) -> dict:
+        """执行一次对齐：统一网格 + 按炉切段，落审计并返回完整产物。
+
+        部分失败（时间戳倒退、采样缺失、炉界异常）不抛错，在产物里以
+        ``anomalies`` 和逐点 ``trusted=false`` 标出，并单独发审计告警。
+        """
+
+        specs = self._signal_specs(signals)
+        if not specs:
+            raise CokeError("没有任何已登记信号可供对齐", component="alignment")
+        samples = {spec.signal: self.signals.samples(spec.signal) for spec in specs}
+        records = self._audit_records()
+        run_id = self.alignment_ids.next()
+        try:
+            run = build_alignment(
+                specs,
+                samples,
+                records,
+                period_s=self.config.alignment.grid_period_s,
+                run_id=run_id,
+            )
+        except ValueError as error:
+            raise CokeError(str(error), component="alignment") from error
+
+        payload = run.as_dict(full_precision=True)
+        self.alignment_journal.append(payload)
+        self._last_alignment = payload
+
+        degraded = [item for item in run.anomalies if item.get("reason")]
+        self.bus.publish(
+            Event.of(
+                "audit",
+                "alignment",
+                "alignment_built",
+                severity="warning" if degraded else "notice",
+                run_id=run_id,
+                heats=len(run.cutting.heats),
+                grid_points=run.grid.count,
+                anomalies=len(run.anomalies),
+                digest=run.digest,
+                degraded=bool(degraded),
+                message=f"对齐完成：{len(run.cutting.heats)} 炉，{len(run.anomalies)} 处不可信标记",
+            )
+        )
+        return run.as_dict()
+
+    def list_alignment_runs(self) -> list[dict]:
+        """返回历次对齐产物的索引（不含逐点值，供控制台选择某一炉回放）。"""
+
+        recorded = self.alignment_journal.read_all()
+        return [
+            {
+                "run_id": item.get("run_id"),
+                "window": item.get("window"),
+                "grid": {"period_s": item.get("grid", {}).get("period_s"),
+                         "count": item.get("grid", {}).get("count")},
+                "heat_count": item.get("heats", {}).get("count", 0),
+                "anomalies": len(item.get("anomalies", [])),
+                "digest": item.get("digest"),
+            }
+            for item in recorded
+        ]
+
+    def _load_run(self, run_id: str | None) -> AlignmentRun:
+        recorded = self.alignment_journal.read_all()
+        if not recorded:
+            raise CokeError("还没有任何对齐结果，先执行一次对齐", component="alignment")
+        chosen = recorded[-1]
+        if run_id is not None:
+            for item in recorded:
+                if item.get("run_id") == run_id:
+                    chosen = item
+                    break
+            else:
+                raise CokeError(f"未找到对齐结果 {run_id!r}", component="alignment")
+        return run_from_dict(chosen)
+
+    def alignment_heats(self, run_id: str | None = None) -> dict:
+        """返回某轮对齐的按炉跳转表（炉号 → 起始网格下标）。"""
+
+        run = self._load_run(run_id)
+        return {"run_id": run.run_id, "boundary": "heat", "heats": list_heat_jumps(run)}
+
+    def replay_heat(self, heat_id: str, run_id: str | None = None) -> dict:
+        """切出某一炉在统一网格上的工况切片与该炉审计记录，供回放跳转。"""
+
+        run = self._load_run(run_id)
+        try:
+            replay = replay_heat(run, heat_id, self._audit_records())
+        except KeyError as error:
+            raise CokeError(str(error).strip("'"), component="alignment") from error
+        return {"run_id": run.run_id, **replay.as_dict()}
+
+    def verify_alignment_run(self, run_id: str | None = None) -> dict:
+        """按同一时间轴核对对齐产物与审计记录的一致性。"""
+
+        run = self._load_run(run_id)
+        result = verify_alignment(run, self._audit_records())
+        report = {"run_id": run.run_id, **result.as_dict()}
+        self.bus.publish(
+            Event.of(
+                "audit",
+                "alignment",
+                "alignment_verified",
+                severity="notice" if report["ok"] else "alarm",
+                run_id=run.run_id,
+                ok=report["ok"],
+                problems=list(report["problems"]),
+                message="对齐与审计时间轴一致" if report["ok"] else "对齐与审计时间轴核对不一致",
+            )
+        )
+        return report
 
 
 def build_platform(

@@ -213,6 +213,25 @@ class DustLimits:
 
 
 @dataclass(frozen=True)
+class AlignmentLimits:
+    """趋势时间对齐与按炉切段参数。
+
+    ``grid_period_s`` 是统一时间网格的固定周期；``max_gap_periods`` 是模拟
+    量允许的最近点前插跨度（多少个网格周期），超出即把缺采段标不可信。
+    切段口径在代码里定死为按炉界，不做成配置项，避免现场改口。
+    """
+
+    grid_period_s: float
+    max_gap_periods: int
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "AlignmentLimits":
+        period = _number(section, "grid_period_s", minimum=0.001)
+        gap = int(_number(section, "max_gap_periods", minimum=0.0))
+        return cls(grid_period_s=period, max_gap_periods=gap)
+
+
+@dataclass(frozen=True)
 class PlatformConfig:
     """一份完整的平台配置。"""
 
@@ -226,6 +245,7 @@ class PlatformConfig:
     door: DoorLimits
     heating: HeatingLimits
     dust: DustLimits
+    alignment: AlignmentLimits
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "PlatformConfig":
@@ -238,6 +258,13 @@ class PlatformConfig:
             raise ConfigError("platform.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        alignment_raw = mapping.get("alignment")
+        if alignment_raw is None:
+            alignment = AlignmentLimits(grid_period_s=5.0, max_gap_periods=3)
+        elif not isinstance(alignment_raw, Mapping):
+            raise ConfigError("配置段落 'alignment' 必须是映射", component="config")
+        else:
+            alignment = AlignmentLimits.from_mapping(alignment_raw)
         return cls(
             name=name,
             storage_root=storage_root,
@@ -249,6 +276,7 @@ class PlatformConfig:
             door=DoorLimits.from_mapping(_section(limits, "door")),
             heating=HeatingLimits.from_mapping(_section(limits, "heating")),
             dust=DustLimits.from_mapping(_section(limits, "dust")),
+            alignment=alignment,
         )
 
 
@@ -278,6 +306,7 @@ def default_config() -> PlatformConfig:
         door=DoorLimits(60.0, 45.0),
         heating=HeatingLimits(1800.0, 1180.0, 35.0, 4.0),
         dust=DustLimits(70.0, 14.0, 1.5),
+        alignment=AlignmentLimits(5.0, 3),
     )
 
 
@@ -331,5 +360,9 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "damper_rate_deg_per_s": cfg.dust.damper_rate_deg_per_s,
                 "linkage_lag_s": cfg.dust.linkage_lag_s,
             },
+        },
+        "alignment": {
+            "grid_period_s": cfg.alignment.grid_period_s,
+            "max_gap_periods": cfg.alignment.max_gap_periods,
         },
     }

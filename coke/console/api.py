@@ -46,6 +46,12 @@ class Api:
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/readiness", self._readiness)
+        add("POST", "/api/signals/ingest", self._signal_ingest)
+        add("POST", "/api/alignment/run", self._alignment_run)
+        add("GET", "/api/alignment/runs", lambda params, body: {"runs": self._platform.list_alignment_runs()})
+        add("GET", "/api/alignment/heats", self._alignment_heats)
+        add("GET", "/api/alignment/replay", self._alignment_replay)
+        add("GET", "/api/alignment/verify", self._alignment_verify)
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
         add("POST", "/api/push", self._push)
@@ -184,3 +190,37 @@ class Api:
 
     def _concurrency(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_probe(rounds=int(body.get("rounds", 24)))
+
+    def _signal_ingest(self, params: dict, body: dict) -> dict:
+        signal = str(body.get("signal", "")).strip()
+        if not signal:
+            raise CokeError("参数 'signal' 不能为空", component="console")
+        kind = body.get("kind")
+        return {
+            "sample": self._platform.ingest_signal(
+                signal=signal,
+                ts=_as_float(body, "ts", self._platform.clock.now()),
+                value=_as_float(body, "value", 0.0),
+                kind=None if kind is None else str(kind),
+            )
+        }
+
+    def _alignment_run(self, params: dict, body: dict) -> dict:
+        signals = body.get("signals")
+        if signals is not None and not isinstance(signals, list):
+            raise CokeError("参数 'signals' 必须是信号名列表", component="console")
+        return self._platform.build_alignment_run(
+            signals=None if signals is None else [str(item) for item in signals]
+        )
+
+    def _alignment_heats(self, params: dict, body: dict) -> dict:
+        return self._platform.alignment_heats(run_id=params.get("run_id"))
+
+    def _alignment_replay(self, params: dict, body: dict) -> dict:
+        heat_id = params.get("heat_id")
+        if not heat_id:
+            raise CokeError("参数 'heat_id' 不能为空（形如 oven01#1）", component="console")
+        return self._platform.replay_heat(heat_id=heat_id, run_id=params.get("run_id"))
+
+    def _alignment_verify(self, params: dict, body: dict) -> dict:
+        return self._platform.verify_alignment_run(run_id=params.get("run_id"))
